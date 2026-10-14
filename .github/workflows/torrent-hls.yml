@@ -1,0 +1,118 @@
+name: Torrent to HLS
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: "Magnet link or .torrent URL"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 ffmpeg
+
+      - name: Download torrent
+        env:
+          LINK: ${{ inputs.link }}
+        run: |
+          mkdir -p dl
+          aria2c \
+            --seed-time=0 \
+            --bt-stop-timeout=900 \
+            --summary-interval=30 \
+            --file-allocation=none \
+            -d dl "$LINK"
+
+      - name: Convert to HLS
+        run: |
+          set -euo pipefail
+
+          # Pick biggest video file
+          FILE="$(find dl -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' \) -printf '%s\t%p\n' | sort -nr | head -1 | cut -f2-)"
+          if [ -z "$FILE" ]; then
+            echo "No video file found"
+            exit 1
+          fi
+          echo "Source: $FILE"
+
+          SIZE="$(stat -c%s "$FILE")"
+          VCODEC="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$FILE")"
+          ACODEC="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$FILE" || true)"
+          DURATION="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$FILE")"
+          echo "Video: $VCODEC | Audio: $ACODEC | Size: $SIZE | Duration: $DURATION"
+
+          mkdir -p site/video
+          LIMIT=$((900 * 1000 * 1000))
+
+          if [ "$VCODEC" = "h264" ] && [ "$ACODEC" = "aac" ] && [ "$SIZE" -lt "$LIMIT" ]; then
+            echo "Mode: copy"
+            ffmpeg -y -i "$FILE" \
+              -map 0:v:0 -map 0:a:0? \
+              -c copy \
+              -f hls -hls_time 10 -hls_playlist_type vod \
+              -hls_segment_filename "site/video/seg_%05d.ts" \
+              site/video/index.m3u8
+          else
+            echo "Mode: encode"
+            # Target total about 850 MB. Audio 128 kbps.
+            VBITRATE="$(awk -v d="$DURATION" 'BEGIN { b = (850*8*1000*1000)/d - 128000; if (b > 4000000) b = 4000000; if (b < 300000) b = 300000; printf "%d", b }')"
+            echo "Video bitrate: $VBITRATE"
+            ffmpeg -y -i "$FILE" \
+              -map 0:v:0 -map 0:a:0? \
+              -c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p \
+              -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "$((VBITRATE * 2))" \
+              -g 48 -keyint_min 48 -sc_threshold 0 \
+              -c:a aac -b:a 128k -ac 2 \
+              -f hls -hls_time 10 -hls_playlist_type vod \
+              -hls_segment_filename "site/video/seg_%05d.ts" \
+              site/video/index.m3u8
+          fi
+
+          # Add player page
+          cp site/index.html site/index.html.bak 2>/dev/null || true
+          rm -f site/index.html.bak
+
+          echo "Final size:"
+          du -sh site
+
+          # Pages limit check
+          TOTAL="$(du -sb site | cut -f1)"
+          if [ "$TOTAL" -gt 1000000000 ]; then
+            echo "Site too big for Pages (over 1 GB)"
+            exit 1
+          fi
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
